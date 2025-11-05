@@ -1,57 +1,42 @@
-# main.py
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-import cv2, numpy as np, mediapipe as mp, base64, re, uvicorn
-from pathlib import Path
+from __future__ import annotations
 
+import base64
+import re
+import time
+from pathlib import Path
+from typing import Dict, Optional
+
+import cv2
+import mediapipe as mp
+import numpy as np
+import uvicorn
+from fastapi import FastAPI, HTTPException, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+
+from capture_service import (
+    app as webrtc_app,
+    set_recognizer,
+    get_latest_sign,
+    get_stats,
+)
 
 BASE_DIR = Path(__file__).parent
 DATASET_PATH = BASE_DIR / "assets" / "dataSet.txt"
 
 if not DATASET_PATH.exists():
-
     raise FileNotFoundError(
         f"Dataset file not found: {DATASET_PATH}\n"
-        f"→ 'signlanguage/assets/dataSet.txt' 에 파일을 두세요."
+        f"'{BASE_DIR.name}/assets/dataSet.txt' 경로를 확인하세요."
     )
 
+# 학습 데이터 로드
 file = np.genfromtxt(str(DATASET_PATH), delimiter=",", dtype=np.float32)
 anglefile = np.array(file[:, :-1], dtype=np.float32)
 labelfile = np.array(file[:, -1], dtype=np.float32)
 
-
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    # allow_origins=["http://localhost:3000"],
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-mp_hands = mp.solutions.hands
-mp_drawing = mp.solutions.drawing_utils
-hands = mp_hands.Hands(
-    max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5
-)
-
-# KNN 모델 로드
-# file = np.genfromtxt(r"c:/Users/jun/Documents/aiprac/dataSet.txt", delimiter=",")
-file = np.genfromtxt(str(DATASET_PATH), delimiter=",", dtype=np.float32)
-anglefile = np.array(file[:, :-1], dtype=np.float32)
-labelfile = np.array(file[:, -1], dtype=np.float32)
-knn = cv2.ml.KNearest_create()
-knn.train(anglefile, cv2.ml.ROW_SAMPLE, labelfile)
-
-gesture = {
+gesture: Dict[int, str] = {
     0: "alpha",
     1: "bravo",
     2: "charlie",
@@ -82,6 +67,58 @@ gesture = {
     27: "clear",
 }
 
+knn = cv2.ml.KNearest_create()
+knn.train(anglefile, cv2.ml.ROW_SAMPLE, labelfile)
+
+# WebRTC 앱 가져오기
+app = webrtc_app
+
+mp_hands = mp.solutions.hands
+mp_drawing = mp.solutions.drawing_utils
+
+
+def classify_from_landmarks(landmarks: np.ndarray) -> str:
+
+    if landmarks.shape != (42, 3):
+        return ""
+
+    left = landmarks[:21]
+    right = landmarks[21:]
+    # handedness score 합이 더 큰 손을 선택 (score가 0이면 손이 없는 것으로 간주)
+    if right[:, 2].sum() > left[:, 2].sum():
+        active = right
+    else:
+        active = left
+
+    if active[:, 2].sum() < 1e-3:
+        return ""
+
+    joint = np.zeros((21, 3), dtype=np.float32)
+    joint[:, :2] = active[:, :2]
+    # 3D 벡터 계산 (z값 없으므로 0으로 두어 2D 각도 기반으로 추정)
+    v1 = joint[[0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 0, 13, 14, 15, 0, 17, 18, 19], :]
+    v2 = joint[
+        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], :
+    ]
+    v = v2 - v1
+    norms = np.linalg.norm(v, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    v = v / norms
+
+    compare_v1 = v[[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18], :]
+    compare_v2 = v[[1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19], :]
+    dot = np.einsum("nt,nt->n", compare_v1, compare_v2)
+    dot = np.clip(dot, -1.0, 1.0)
+    angle = np.degrees(np.arccos(dot)).astype(np.float32)
+
+    _, results, _, _ = knn.findNearest(angle.reshape(1, -1), 3)
+    index = int(results[0][0])
+    return gesture.get(index, "")
+
+
+# WebRTC 서비스에 recognizer 등록
+set_recognizer(classify_from_landmarks)
+
 
 class FrameRequest(BaseModel):
     frame_data: str
@@ -94,19 +131,25 @@ class FrameResponse(BaseModel):
 
 @app.post("/translate", response_model=FrameResponse)
 async def recognize(req: FrameRequest):
-    # Base64 → OpenCV
+    """
+    기존 Base64 업로드 경로 유지 (필요 시).
+    """
     img_str = re.sub("^data:image/.+;base64,", "", req.frame_data)
     img_bytes = base64.b64decode(img_str)
     nparr = np.frombuffer(img_bytes, np.uint8)
     img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
     detected_sign = ""
+    result = mp_hands.Hands(
+        max_num_hands=1, min_detection_confidence=0.5, min_tracking_confidence=0.5
+    ).process(img_rgb)
 
-    result = hands.process(imgRGB)
     if result.multi_hand_landmarks:
         for res in result.multi_hand_landmarks:
-            joint = np.array([[lm.x, lm.y, lm.z] for lm in res.landmark])
+            joint = np.array(
+                [[lm.x, lm.y, lm.z] for lm in res.landmark], dtype=np.float32
+            )
             v1 = joint[
                 [0, 1, 2, 3, 0, 5, 6, 7, 0, 9, 10, 11, 0, 13, 14, 15, 0, 17, 18, 19], :
             ]
@@ -116,23 +159,36 @@ async def recognize(req: FrameRequest):
             ]
             v = v2 - v1
             v = v / np.linalg.norm(v, axis=1)[:, np.newaxis]
-            compareV1 = v[[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18], :]
-            compareV2 = v[[1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19], :]
-            angle = np.degrees(np.arccos(np.einsum("nt,nt->n", compareV1, compareV2)))
-            data = np.array([angle], dtype=np.float32)
-            _, results, _, _ = knn.findNearest(data, 3)
+            compare_v1 = v[[0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 16, 17, 18], :]
+            compare_v2 = v[[1, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15, 17, 18, 19], :]
+            angle = np.degrees(np.arccos(np.einsum("nt,nt->n", compare_v1, compare_v2)))
+            _, results, _, _ = knn.findNearest(angle.reshape(1, -1), 3)
             index = int(results[0][0])
             detected_sign = gesture.get(index, "")
-
             mp_drawing.draw_landmarks(img, res, mp_hands.HAND_CONNECTIONS)
 
     _, buffer = cv2.imencode(".jpg", img)
     img_base64 = base64.b64encode(buffer).decode("utf-8")
-
     return FrameResponse(
         detected_sign=detected_sign,
         processed_frame=f"data:image/jpeg;base64,{img_base64}",
     )
+
+
+# ---------------------------
+#  WebRTC 상태 조회 라우트
+# ---------------------------
+@app.get("/capture/status")
+async def capture_status():
+    """WebRTC 처리 상태 조회"""
+    stats = get_stats()
+    return {
+        "running": stats["frames_captured"] > 0,
+        "latest_sign": stats["latest_sign"],
+        "frames_captured": stats["frames_captured"],
+        "duration_sec": stats["duration_sec"],
+        "avg_fps": stats["avg_fps"],
+    }
 
 
 if __name__ == "__main__":
